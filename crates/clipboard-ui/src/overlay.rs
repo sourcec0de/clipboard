@@ -14,6 +14,7 @@ use clipboard_core::QuickPasteMenuStyle;
 use clipboard_core::TextFilter;
 use nsh_base::button as base_button;
 use nsh_base::theme;
+use nsh_core::EllipsizeMode;
 use nsh_core::desktop::DisplayId;
 use nsh_core::desktop::WindowAttributes;
 use nsh_core::desktop::WindowFrameStyle;
@@ -71,6 +72,8 @@ use crate::ui::tokens;
 
 const OVERLAY_WIDTH: f32 = 420.0;
 const OVERLAY_HEIGHT: f32 = 460.0;
+const COMPACT_ROW_HEIGHT: f32 = 38.0;
+const NORMAL_ROW_HEIGHT: f32 = 60.0;
 const IMAGE_ROW_MAX_HEIGHT: f32 = 54.0;
 const IMAGE_THUMB_MAX_W: u32 = 160;
 const IMAGE_THUMB_MAX_H: u32 = 42;
@@ -357,7 +360,7 @@ fn clippings_list() -> impl IntoElement {
                 }
                 let h = items
                     .get(selected_index)
-                    .map_or(56.0, |item| row_height_for(item, density));
+                    .map_or(NORMAL_ROW_HEIGHT, |item| row_height_for(item, density));
                 (top, h)
             })
         });
@@ -388,9 +391,9 @@ fn clippings_list() -> impl IntoElement {
     })
     .estimated_item_size(move || {
         if density_sig.get() == QuickPasteMenuStyle::Compact {
-            px(36.0)
+            px(COMPACT_ROW_HEIGHT)
         } else {
-            px(56.0)
+            px(NORMAL_ROW_HEIGHT)
         }
     })
     .empty(empty_state(
@@ -412,9 +415,9 @@ fn row_height_for(item: &Clipping, density: QuickPasteMenuStyle) -> f32 {
     if item.kind == ClippingKind::Image {
         IMAGE_ROW_MAX_HEIGHT
     } else if density == QuickPasteMenuStyle::Compact {
-        36.0
+        COMPACT_ROW_HEIGHT
     } else {
-        56.0
+        NORMAL_ROW_HEIGHT
     }
 }
 
@@ -436,7 +439,7 @@ fn virtual_clipping_row(
         let density = density_sig.get();
         state::store_signal().with(|s| {
             s.visible_at(idx)
-                .map_or(56.0, |item| row_height_for(item, density))
+                .map_or(NORMAL_ROW_HEIGHT, |item| row_height_for(item, density))
         })
     });
 
@@ -516,8 +519,8 @@ fn virtual_text_preview(
         let _rev = data_rev.get();
         let idx = pos.index();
         let max_chars = match density_sig.get() {
-            QuickPasteMenuStyle::Compact => 42,
-            _ => 76,
+            QuickPasteMenuStyle::Compact => 80,
+            _ => 160,
         };
         state::store_signal().with(|s| {
             s.visible_at(idx)
@@ -525,21 +528,27 @@ fn virtual_text_preview(
         })
     });
 
-    view()
-        .max_h(px(38.0))
-        .overflow_hidden()
-        .justify_center()
-        .child(
-            text(move || preview_str.get())
-                .text_sm()
-                .text_color(move || {
-                    if is_selected() {
-                        theme().primary_foreground
-                    } else {
-                        theme().popover_foreground
-                    }
-                }),
-        )
+    let max_lines = computed(move || {
+        if density_sig.get() == QuickPasteMenuStyle::Compact {
+            1_u32
+        } else {
+            2_u32
+        }
+    });
+
+    view().w_full().overflow_hidden().justify_center().child(
+        text(move || preview_str.get())
+            .text_sm()
+            .number_of_lines(max_lines)
+            .text_overflow(EllipsizeMode::Tail)
+            .text_color(move || {
+                if is_selected() {
+                    theme().primary_foreground
+                } else {
+                    theme().popover_foreground
+                }
+            }),
+    )
 }
 
 fn virtual_image_preview(
