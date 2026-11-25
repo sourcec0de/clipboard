@@ -14,6 +14,7 @@ use clipboard_core::QuickPasteMenuStyle;
 use clipboard_core::TextFilter;
 use nsh_base::button as base_button;
 use nsh_base::theme;
+use nsh_core::desktop::DisplayId;
 use nsh_core::desktop::WindowAttributes;
 use nsh_core::desktop::WindowFrameStyle;
 use nsh_core::desktop::WindowKind;
@@ -75,24 +76,37 @@ const IMAGE_THUMB_MAX_W: u32 = 160;
 const IMAGE_THUMB_MAX_H: u32 = 42;
 
 /// Declares the separate floating Quick Paste overlay window in the reactive tree.
+///
+/// Rebuilds the window placement from the live [`displays`] list every time the overlay opens so
+/// detaching/switching monitors or moving to laptop mode always recenters on the current display.
 pub(crate) fn floating_clipboard_window() -> impl IntoElement {
     let is_open = computed(|| state::store_signal().with(|s| s.overlay_open));
 
-    window()
-        .id("clipboard-quick-paste")
-        .kind(WindowKind::Panel)
-        .default_size(Size::new(px(OVERLAY_WIDTH), px(OVERLAY_HEIGHT)))
-        .default_position(overlay_position())
-        .restore_bounds(false)
-        .attributes(overlay_window_attributes())
-        .open(is_open)
-        .on_open_change(|ev: &OpenChange| {
-            if !ev.open {
-                state::close_overlay();
+    when(
+        move || is_open.get(),
+        move || {
+            let (display_id, position) = overlay_placement();
+            let mut win = window()
+                .id("clipboard-quick-paste")
+                .kind(WindowKind::Panel)
+                .default_size(Size::new(px(OVERLAY_WIDTH), px(OVERLAY_HEIGHT)))
+                .default_position(position)
+                .restore_bounds(false)
+                .attributes(overlay_window_attributes())
+                .open(true)
+                .on_open_change(|ev: &OpenChange| {
+                    if !ev.open {
+                        state::close_overlay();
+                    }
+                })
+                .on_close_press(|_| state::close_overlay())
+                .content(overlay_surface);
+            if let Some(id) = display_id {
+                win = win.display(id);
             }
-        })
-        .on_close_press(|_| state::close_overlay())
-        .content(overlay_surface)
+            win
+        },
+    )
 }
 
 fn overlay_window_attributes() -> WindowAttributes {
@@ -116,15 +130,18 @@ fn overlay_window_attributes() -> WindowAttributes {
     attrs
 }
 
-fn overlay_position() -> WindowPosition {
-    let all = displays();
+fn overlay_placement() -> (Option<DisplayId>, WindowPosition) {
+    let all = untracked(displays);
     let Some(primary) = all.iter().find(|d| d.primary).or_else(|| all.first()) else {
-        return WindowPosition::Center;
+        return (None, WindowPosition::Center);
     };
     let bounds = primary.visible_bounds;
     let x = bounds.origin.x.0 + ((bounds.size.width.0 - OVERLAY_WIDTH) * 0.5).max(0.0);
     let y = bounds.origin.y.0 + ((bounds.size.height.0 - OVERLAY_HEIGHT) * 0.35).max(24.0);
-    WindowPosition::At(Point::new(Points(x), Points(y)))
+    (
+        Some(primary.id),
+        WindowPosition::At(Point::new(Points(x), Points(y))),
+    )
 }
 
 /// Renders the Quick Paste overlay card (also mountable inline for headless testing).
