@@ -1,5 +1,6 @@
 //! Central reactive application store, background clipboard monitor, and paste orchestration.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -145,6 +146,8 @@ pub(crate) struct AppState {
     pub search_query: String,
     /// Index of the currently highlighted row in the filtered overlay list.
     pub selected_index: usize,
+    /// Optional range anchor when extending selection with Shift+Up / Shift+Down.
+    pub selection_anchor: Option<usize>,
     /// Monotonic counter incremented whenever the overlay search input should be focused.
     pub search_focus_seq: u64,
     /// Whether keyboard focus is currently navigating the list rather than typing in search.
@@ -173,33 +176,103 @@ pub(crate) struct AppState {
     pub status_message: String,
     /// Revision counter incremented when settings shortcuts change so global hotkeys re-sync.
     pub shortcuts_revision: u64,
+    /// Revision counter incremented only when visible list items or row density change.
+    pub list_data_revision: u64,
 }
 
 impl AppState {
-    /// Returns the filtered list of clippings currently visible in the Quick Paste overlay.
+    /// Returns borrowed references to the filtered clippings currently visible in the overlay.
     #[must_use]
-    pub(crate) fn visible_clippings(&self) -> Vec<Clipping> {
+    pub(crate) fn visible_clipping_refs(&self) -> Vec<&Clipping> {
         let base: Vec<&Clipping> = match self.overlay_source {
             OverlaySource::Clipboard => self.history.items.iter().collect(),
             OverlaySource::SequentialQueue => self.history.sequential_items(),
             OverlaySource::Pinned => self.history.items.iter().filter(|c| c.pinned).collect(),
         };
         if self.search_query.trim().is_empty() {
-            base.into_iter().cloned().collect()
+            base
         } else {
             base.into_iter()
                 .filter(|c| c.matches_query(&self.search_query))
-                .cloned()
                 .collect()
         }
     }
 
-    /// Returns the currently selected clipping in the overlay, if any.
+    /// Returns the number of visible clippings without cloning any items.
+    #[must_use]
+    pub(crate) fn visible_count(&self) -> usize {
+        self.visible_clipping_refs().len()
+    }
+
+    /// Returns the visible clipping at `index` by reference without cloning the whole list.
+    #[must_use]
+    pub(crate) fn visible_at(&self, index: usize) -> Option<&Clipping> {
+        self.visible_clipping_refs().get(index).copied()
+    }
+
+    /// Returns the stable UUIDs of all visible clippings for `virtual_list::keys`.
+    #[must_use]
+    pub(crate) fn visible_ids(&self) -> Vec<Uuid> {
+        self.visible_clipping_refs().iter().map(|c| c.id).collect()
+    }
+
+    /// Returns the inclusive `(start, end)` index range of currently selected overlay rows.
+    #[must_use]
+    pub(crate) fn selected_range(&self) -> (usize, usize) {
+        let anchor = self.selection_anchor.unwrap_or(self.selected_index);
+        (
+            anchor.min(self.selected_index),
+            anchor.max(self.selected_index),
+        )
+    }
+
+    /// Returns the currently focused clipping in the overlay, if any.
     #[must_use]
     pub(crate) fn selected_clipping(&self) -> Option<Clipping> {
-        let items = self.visible_clippings();
-        items.get(self.selected_index).cloned()
+        self.visible_at(self.selected_index).cloned()
     }
+
+    /// Returns all currently selected clippings in list order (1 item normally, N items with Shift-select).
+    #[must_use]
+    pub(crate) fn selected_clippings(&self) -> Vec<Clipping> {
+        let items = self.visible_clipping_refs();
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let (lo, hi) = self.selected_range();
+        let end = hi.min(items.len() - 1);
+        let start = lo.min(end);
+        items[start..=end].iter().map(|c| (*c).clone()).collect()
+    }
+}
+
+type ThumbnailEntry = Option<(u32, u32, nsh_core::element::ImageSrc)>;
+
+static THUMBNAIL_CACHE: OnceLock<Mutex<HashMap<Uuid, ThumbnailEntry>>> = OnceLock::new();
+
+/// Decodes and caches a bounded RGBA thumbnail for an image clipping so PNG decoding runs at most once.
+#[must_use]
+pub(crate) fn cached_image_thumbnail(
+    item: &Clipping,
+    max_w: u32,
+    max_h: u32,
+) -> Option<(u32, u32, nsh_core::element::ImageSrc)> {
+    let cache = THUMBNAIL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(&item.id)
+    {
+        return cached.clone();
+    }
+    let decoded = item
+        .decode_bounded_rgba(max_w, max_h)
+        .map(|(w, h, rgba)| (w, h, nsh_core::element::ImageSrc::rgba(w, h, rgba)));
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 256 {
+            guard.clear();
+        }
+        guard.insert(item.id, decoded.clone());
+    }
+    decoded
 }
 
 enum BgEvent {
@@ -279,6 +352,7 @@ pub(crate) fn ensure_started() {
         overlay_source: OverlaySource::Clipboard,
         search_query: String::new(),
         selected_index: 0,
+        selection_anchor: None,
         search_focus_seq: 0,
         list_focused: false,
         preview_open: false,
@@ -293,6 +367,7 @@ pub(crate) fn ensure_started() {
         installed_apps,
         status_message: format!("Local only · {}", host.platform_name()),
         shortcuts_revision: 1,
+        list_data_revision: 1,
     };
 
     let sig = signal_with(initial, SignalEquals::Never);
@@ -328,6 +403,7 @@ pub(crate) fn store_signal() -> Signal<AppState> {
                     overlay_source: OverlaySource::Clipboard,
                     search_query: String::new(),
                     selected_index: 0,
+                    selection_anchor: None,
                     search_focus_seq: 0,
                     list_focused: false,
                     preview_open: false,
@@ -342,6 +418,7 @@ pub(crate) fn store_signal() -> Signal<AppState> {
                     installed_apps: Vec::new(),
                     status_message: String::new(),
                     shortcuts_revision: 1,
+                    list_data_revision: 1,
                 },
                 SignalEquals::Never,
             )
@@ -418,6 +495,7 @@ pub(crate) fn ingest_snapshot(snapshot: ClipboardSnapshot) {
         match outcome {
             IngestOutcome::Recorded => {
                 s.status_message = format!("{} clippings stored locally", s.history.items.len());
+                s.list_data_revision = s.list_data_revision.saturating_add(1);
                 persist_history(&s.history);
             }
             IngestOutcome::IgnoredTransient => {
@@ -477,10 +555,12 @@ pub(crate) fn open_overlay() {
         s.overlay_open = true;
         s.search_query.clear();
         s.selected_index = 0;
+        s.selection_anchor = None;
         s.list_focused = false;
         s.filter_picker_open = false;
         s.pending_delete_id = None;
         s.previous_app_target = prev_target;
+        s.list_data_revision = s.list_data_revision.saturating_add(1);
         s.search_focus_seq = s.search_focus_seq.saturating_add(1);
     });
 }
@@ -517,6 +597,8 @@ pub(crate) fn cycle_overlay_source() {
     store_signal().update(|s| {
         s.overlay_source = s.overlay_source.next();
         s.selected_index = 0;
+        s.selection_anchor = None;
+        s.list_data_revision = s.list_data_revision.saturating_add(1);
     });
 }
 
@@ -525,7 +607,9 @@ pub(crate) fn set_search_query(query: &str) {
     store_signal().update(|s| {
         query.clone_into(&mut s.search_query);
         s.selected_index = 0;
+        s.selection_anchor = None;
         s.list_focused = false;
+        s.list_data_revision = s.list_data_revision.saturating_add(1);
     });
 }
 
@@ -551,13 +635,37 @@ pub(crate) fn backspace_search() {
     });
 }
 
-/// Moves the overlay selection by `delta` (`-1` for Up, `+1` for Down).
+/// Moves the overlay selection by `delta` (`-1` for Up, `+1` for Down), clearing any multi-selection.
 pub(crate) fn move_selection(delta: isize) {
     store_signal().update(|s| {
-        let len = s.visible_clippings().len();
+        let len = s.visible_count();
         if len == 0 {
             s.selected_index = 0;
+            s.selection_anchor = None;
             return;
+        }
+        let next = if delta < 0 {
+            s.selected_index.saturating_sub(delta.unsigned_abs())
+        } else {
+            (s.selected_index + delta.unsigned_abs()).min(len - 1)
+        };
+        s.selected_index = next;
+        s.selection_anchor = None;
+        s.list_focused = true;
+    });
+}
+
+/// Extends the overlay selection range by `delta` while holding Shift (`Shift+Up` / `Shift+Down`).
+pub(crate) fn extend_selection(delta: isize) {
+    store_signal().update(|s| {
+        let len = s.visible_count();
+        if len == 0 {
+            s.selected_index = 0;
+            s.selection_anchor = None;
+            return;
+        }
+        if s.selection_anchor.is_none() {
+            s.selection_anchor = Some(s.selected_index);
         }
         let next = if delta < 0 {
             s.selected_index.saturating_sub(delta.unsigned_abs())
@@ -569,12 +677,13 @@ pub(crate) fn move_selection(delta: isize) {
     });
 }
 
-/// Directly selects a row by index in the filtered overlay list.
+/// Directly selects a single row by index in the filtered overlay list.
 pub(crate) fn select_index(index: usize) {
     store_signal().update(|s| {
-        let len = s.visible_clippings().len();
+        let len = s.visible_count();
         if len > 0 {
             s.selected_index = index.min(len - 1);
+            s.selection_anchor = None;
             s.list_focused = true;
         }
     });
@@ -609,33 +718,60 @@ pub(crate) fn open_filter_window() {
     });
 }
 
-/// Pastes the currently selected clipping in the overlay and closes the overlay.
+/// Pastes the currently selected clipping(s) in the overlay and closes the overlay.
+///
+/// When multiple items are Shift-selected, joins them with newlines and pastes all at once.
 pub(crate) fn paste_selected(plain_override: bool) {
-    let (clipping, always_plain, play_sound) = store_signal().with(|s| {
+    let (selected, always_plain, play_sound) = store_signal().with(|s| {
         (
-            s.selected_clipping(),
+            s.selected_clippings(),
             s.settings.always_paste_plain_text,
             s.settings.enable_interaction_sounds,
         )
     });
-    if let Some(item) = clipping {
-        close_overlay();
-        deliver_clipping(&item, plain_override || always_plain, None, play_sound);
+    if selected.is_empty() {
+        return;
+    }
+    close_overlay();
+    if selected.len() == 1 {
+        deliver_clipping(
+            &selected[0],
+            plain_override || always_plain,
+            None,
+            play_sound,
+        );
+    } else {
+        let combined = combine_clippings_text(&selected, None);
+        deliver_payload(ClipboardWrite::PlainText(combined), play_sound);
     }
 }
 
-/// Pastes the currently selected clipping after applying `filter`.
+/// Pastes the currently selected clipping(s) after applying `filter`.
 pub(crate) fn paste_selected_with_filter(filter: TextFilter) {
-    let (clipping, play_sound) =
-        store_signal().with(|s| (s.selected_clipping(), s.settings.enable_interaction_sounds));
+    let (selected, play_sound) =
+        store_signal().with(|s| (s.selected_clippings(), s.settings.enable_interaction_sounds));
     store_signal().update(|s| {
         s.settings.last_filter = filter;
         persist_settings(&s.settings);
     });
-    if let Some(item) = clipping {
-        close_overlay();
-        deliver_clipping(&item, true, Some(filter), play_sound);
+    if selected.is_empty() {
+        return;
     }
+    close_overlay();
+    if selected.len() == 1 {
+        deliver_clipping(&selected[0], true, Some(filter), play_sound);
+    } else {
+        let combined = combine_clippings_text(&selected, Some(filter));
+        deliver_payload(ClipboardWrite::PlainText(combined), play_sound);
+    }
+}
+
+fn combine_clippings_text(items: &[Clipping], filter: Option<TextFilter>) -> String {
+    items
+        .iter()
+        .map(|item| filter.map_or_else(|| item.text.clone(), |f| f.apply(&item.text)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Pastes the most recent clipping using the last chosen [`TextFilter`].
@@ -740,10 +876,12 @@ pub(crate) fn confirm_delete_pending() {
 pub(crate) fn remove_clipping(id: Uuid) {
     store_signal().update(|s| {
         if s.history.remove(id) {
-            let len = s.visible_clippings().len();
+            let len = s.visible_count();
             if s.selected_index >= len && len > 0 {
                 s.selected_index = len - 1;
             }
+            s.selection_anchor = None;
+            s.list_data_revision = s.list_data_revision.saturating_add(1);
             persist_history(&s.history);
         }
     });
@@ -754,6 +892,8 @@ pub(crate) fn clear_history() {
     store_signal().update(|s| {
         s.history.clear_unpinned();
         s.selected_index = 0;
+        s.selection_anchor = None;
+        s.list_data_revision = s.list_data_revision.saturating_add(1);
         "Clipboard history cleared".clone_into(&mut s.status_message);
         persist_history(&s.history);
     });
@@ -786,6 +926,10 @@ fn deliver_clipping(
         _ => return,
     };
 
+    deliver_payload(payload, play_sound);
+}
+
+fn deliver_payload(payload: ClipboardWrite, play_sound: bool) {
     let target_app = store_signal().with(|s| s.previous_app_target.clone());
 
     mark_self_write();
@@ -798,6 +942,8 @@ fn deliver_clipping(
     };
 
     // Perform clipboard write, restore focus to original app, and simulate paste off the UI thread.
+    // Pasting is intentionally silent (never plays a sound).
+    let _ = play_sound;
     thread::spawn(move || {
         log::info!("deliver_clipping: restoring focus to target={target_app:?} and pasting");
         let res = host.write_clipboard(&payload).and_then(|()| {
@@ -808,13 +954,6 @@ fn deliver_clipping(
             log::warn!("paste failed: {err}");
         } else {
             log::info!("deliver_clipping: paste succeeded");
-        }
-        if play_sound {
-            if res.is_ok() {
-                host.play_sound(SoundEffect::Paste);
-            } else {
-                host.play_sound(SoundEffect::Error);
-            }
         }
     });
     store_signal().update(|s| {
@@ -877,6 +1016,7 @@ pub(crate) fn set_always_paste_plain_text(enabled: bool) {
 pub(crate) fn set_quick_paste_menu(style: QuickPasteMenuStyle) {
     store_signal().update(|s| {
         s.settings.quick_paste_menu = style;
+        s.list_data_revision = s.list_data_revision.saturating_add(1);
         persist_settings(&s.settings);
     });
 }

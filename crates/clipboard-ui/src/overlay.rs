@@ -22,8 +22,12 @@ use nsh_core::desktop::WindowPointerEvents;
 use nsh_core::desktop::WindowPosition;
 use nsh_core::desktop::Workspaces;
 use nsh_core::element::ComponentBuilder;
+use nsh_core::element::Element;
 use nsh_core::element::ImageSrc;
 use nsh_core::element::Interactive;
+use nsh_core::element::ListLayout;
+use nsh_core::element::Position;
+use nsh_core::element::Scrollable;
 use nsh_core::element::desktop::OpenChange;
 use nsh_core::element::desktop::displays;
 use nsh_core::element::desktop::main_window;
@@ -48,6 +52,7 @@ use nsh_core::prelude::scroll;
 use nsh_core::prelude::text;
 use nsh_core::prelude::untracked;
 use nsh_core::prelude::view;
+use nsh_core::prelude::virtual_list;
 use nsh_core::prelude::when;
 
 use crate::state;
@@ -188,6 +193,8 @@ fn bind_overlay_keys() {
 
     on_key_with("down", repeat_opts, |_| state::move_selection(1));
     on_key_with("up", repeat_opts, |_| state::move_selection(-1));
+    on_key_with("shift+down", repeat_opts, |_| state::extend_selection(1));
+    on_key_with("shift+up", repeat_opts, |_| state::extend_selection(-1));
     on_key_with("enter", once_opts, |_| {
         if state::store_signal().with(|s| s.pending_delete_id.is_some()) {
             state::confirm_delete_pending();
@@ -236,7 +243,7 @@ fn overlay_header() -> impl IntoElement {
             icons::GEAR_SVG,
             18.0,
             "Open Preferences",
-            false,
+            || false,
             false,
             || {
                 state::close_overlay();
@@ -267,58 +274,168 @@ fn overlay_header() -> impl IntoElement {
                     || theme().muted_foreground,
                 )),
         )
-        .child(view().min_w(px(32.0)).items_end().child(when(
-            || state::store_signal().with(|s| s.sequential_mode_active),
-            || badge("SEQ", || BadgeTone::Warning),
-        )))
+        .child(
+            view()
+                .min_w(px(32.0))
+                .flex_row()
+                .items_center()
+                .justify_end()
+                .gap_1()
+                .child(when(
+                    || {
+                        state::store_signal().with(|s| {
+                            let (lo, hi) = s.selected_range();
+                            hi > lo
+                        })
+                    },
+                    || {
+                        badge(
+                            || {
+                                state::store_signal().with(|s| {
+                                    let (lo, hi) = s.selected_range();
+                                    format!("{} selected", hi - lo + 1)
+                                })
+                            },
+                            || BadgeTone::Neutral,
+                        )
+                    },
+                ))
+                .child(when(
+                    || state::store_signal().with(|s| s.sequential_mode_active),
+                    || badge("SEQ", || BadgeTone::Warning),
+                )),
+        )
 }
 
 fn clippings_list() -> impl IntoElement {
-    let list_revision = computed(|| {
+    let list_ref = element_ref();
+    let scroll_y = nsh_core::prelude::stored(0.0_f32);
+    let viewport_h = nsh_core::prelude::stored(374.0_f32);
+
+    // Lightweight revision signal that only ticks when visible items or row density change.
+    let data_rev = computed(|| state::store_signal().with(|s| s.list_data_revision));
+    let item_count = computed(move || {
+        let _rev = data_rev.get();
+        state::store_signal().with(state::AppState::visible_count)
+    });
+    let density_sig = computed(move || {
+        let _rev = data_rev.get();
+        state::store_signal().with(|s| s.settings.quick_paste_menu)
+    });
+
+    // Lightweight selection signal read by recycled cells and auto-scroll.
+    let selection =
+        computed(|| state::store_signal().with(|s| (s.selected_index, s.selected_range())));
+
+    // Keep the selected row scrolled into view smoothly without rebuilding any cells.
+    effect(move || {
+        let (selected_index, _) = selection.get();
+        let (row_top, row_h) = untracked(|| {
+            state::store_signal().with(|s| {
+                let items = s.visible_clipping_refs();
+                let density = s.settings.quick_paste_menu;
+                let mut top = 0.0_f32;
+                for item in items.iter().take(selected_index) {
+                    top += row_height_for(item, density);
+                }
+                let h = items
+                    .get(selected_index)
+                    .map_or(56.0, |item| row_height_for(item, density));
+                (top, h)
+            })
+        });
+        let row_bottom = row_top + row_h;
+
+        let vp_h = viewport_h.get().max(row_h);
+        let current_y = scroll_y.get();
+        let next_y = if row_bottom > current_y + vp_h {
+            Some((row_bottom - vp_h).max(0.0))
+        } else if row_top < current_y {
+            Some(row_top)
+        } else {
+            None
+        };
+        if let Some(target_y) = next_y {
+            scroll_y.replace(target_y);
+            list_ref.scroll_to_offset(px(target_y), false);
+        }
+    });
+
+    virtual_list(item_count, move |pos: Position| {
+        virtual_clipping_row(pos, data_rev, selection, density_sig)
+    })
+    .element_ref(&list_ref)
+    .keys(move || {
+        let _rev = data_rev.get();
+        state::store_signal().with(state::AppState::visible_ids)
+    })
+    .estimated_item_size(move || {
+        if density_sig.get() == QuickPasteMenuStyle::Compact {
+            px(36.0)
+        } else {
+            px(56.0)
+        }
+    })
+    .empty(empty_state(
+        "No clippings found",
+        "Copy text or images anywhere, or clear your search filter.",
+    ))
+    .on_layout(move |bounds: &nsh_core::geometry::Bounds<Points>| {
+        if bounds.size.height.0 > 0.0 {
+            viewport_h.replace(bounds.size.height.0);
+        }
+    })
+    .on_scroll(move |ev: &nsh_core::prelude::ScrollEvent| {
+        scroll_y.replace(ev.offset.y.0.max(0.0));
+    })
+    .flex_1()
+}
+
+fn row_height_for(item: &Clipping, density: QuickPasteMenuStyle) -> f32 {
+    if item.kind == ClippingKind::Image {
+        IMAGE_ROW_MAX_HEIGHT
+    } else if density == QuickPasteMenuStyle::Compact {
+        36.0
+    } else {
+        56.0
+    }
+}
+
+fn virtual_clipping_row(
+    pos: Position,
+    data_rev: nsh_core::prelude::Memo<u64>,
+    selection: nsh_core::prelude::Memo<(usize, (usize, usize))>,
+    density_sig: nsh_core::prelude::Memo<QuickPasteMenuStyle>,
+) -> impl IntoElement {
+    let is_selected = computed(move || {
+        let idx = pos.index();
+        let (_, (lo, hi)) = selection.get();
+        idx >= lo && idx <= hi
+    });
+
+    let row_h = computed(move || {
+        let _rev = data_rev.get();
+        let idx = pos.index();
+        let density = density_sig.get();
         state::store_signal().with(|s| {
-            (
-                s.visible_clippings(),
-                s.selected_index,
-                s.settings.quick_paste_menu,
-            )
+            s.visible_at(idx)
+                .map_or(56.0, |item| row_height_for(item, density))
         })
     });
 
-    scroll().flex_1().child(dynamic(move || {
-        let (items, selected_index, density) = list_revision.get();
-        untracked(|| {
-            if items.is_empty() {
-                return empty_state(
-                    "No clippings found",
-                    "Copy text or images anywhere, or clear your search filter.",
-                )
-                .into_element();
-            }
-
-            view()
-                .children(items.iter().enumerate().map(|(idx, item)| {
-                    let is_selected = idx == selected_index;
-                    clipping_row(item, idx, is_selected, density)
-                }))
-                .into_element()
+    let is_image_row = computed(move || {
+        let _rev = data_rev.get();
+        let idx = pos.index();
+        state::store_signal().with(|s| {
+            s.visible_at(idx)
+                .is_some_and(|item| item.kind == ClippingKind::Image)
         })
-    }))
-}
+    });
 
-fn clipping_row(
-    item: &Clipping,
-    index: usize,
-    is_selected: bool,
-    density: QuickPasteMenuStyle,
-) -> impl IntoElement {
-    let max_chars = match density {
-        QuickPasteMenuStyle::Compact => 42,
-        _ => 76,
-    };
-    let is_image = item.kind == ClippingKind::Image;
-
-    let mut row = view()
+    view()
         .group()
+        .h(move || px(row_h.get()))
+        .overflow_hidden()
         .px_3()
         .py_2()
         .flex_row()
@@ -327,76 +444,150 @@ fn clipping_row(
         .gap_2p5()
         .border_b_1()
         .border_color(move || {
-            if is_selected {
+            if is_selected.get() {
                 theme().primary
             } else {
                 theme().border.opacity(0.6)
             }
         })
         .bg(move || {
-            if is_selected {
+            if is_selected.get() {
                 theme().primary
             } else {
                 theme().popover
             }
         })
         .hover(move |s| {
-            if is_selected {
-                s.bg(move || theme().primary)
-            } else {
-                s.bg(move || theme().accent)
-            }
+            s.bg(move || {
+                if is_selected.get() {
+                    theme().primary
+                } else {
+                    theme().accent
+                }
+            })
         })
-        .transition_colors()
-        .duration(tokens::DURATION_INSTANT)
         .on_press(move || {
-            state::select_index(index);
+            state::select_index(pos.index());
             state::paste_selected(false);
-        });
-
-    row = if is_image {
-        // Strictly bound image row height so thumbnails peek cleanly without expanding the list.
-        row.h(px(IMAGE_ROW_MAX_HEIGHT)).overflow_hidden()
-    } else if density == QuickPasteMenuStyle::Compact {
-        row.h(px(36.0)).overflow_hidden()
-    } else {
-        row.h(px(56.0)).overflow_hidden()
-    };
-
-    let content_el = if is_image {
-        image_row_preview(item, is_selected).into_element()
-    } else {
-        view()
-            .max_h(px(38.0))
-            .overflow_hidden()
-            .justify_center()
-            .child(
-                text(item.preview_text(max_chars))
-                    .text_sm()
-                    .text_color(move || {
-                        if is_selected {
-                            theme().primary_foreground
-                        } else {
-                            theme().popover_foreground
-                        }
+        })
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .justify_center()
+                .child(
+                    when(
+                        move || is_image_row.get(),
+                        move || virtual_image_preview(pos, data_rev, move || is_selected.get()),
+                    )
+                    .otherwise(move || {
+                        virtual_text_preview(pos, data_rev, density_sig, move || is_selected.get())
                     }),
-            )
-            .into_element()
-    };
-
-    row.child(
-        view()
-            .flex_1()
-            .min_w(px(0.0))
-            .overflow_hidden()
-            .justify_center()
-            .child(content_el),
-    )
-    .child(clipping_row_trailing(index, is_selected))
+                ),
+        )
+        .child(virtual_row_trailing(pos, move || is_selected.get()))
 }
 
-fn clipping_row_trailing(index: usize, is_selected: bool) -> impl IntoElement {
-    let index_label = (index + 1).to_string();
+fn virtual_text_preview(
+    pos: Position,
+    data_rev: nsh_core::prelude::Memo<u64>,
+    density_sig: nsh_core::prelude::Memo<QuickPasteMenuStyle>,
+    is_selected: impl Fn() -> bool + Copy + 'static,
+) -> impl IntoElement {
+    let preview_str = computed(move || {
+        let _rev = data_rev.get();
+        let idx = pos.index();
+        let max_chars = match density_sig.get() {
+            QuickPasteMenuStyle::Compact => 42,
+            _ => 76,
+        };
+        state::store_signal().with(|s| {
+            s.visible_at(idx)
+                .map_or_else(String::new, |item| item.preview_text(max_chars))
+        })
+    });
+
+    view()
+        .max_h(px(38.0))
+        .overflow_hidden()
+        .justify_center()
+        .child(
+            text(move || preview_str.get())
+                .text_sm()
+                .text_color(move || {
+                    if is_selected() {
+                        theme().primary_foreground
+                    } else {
+                        theme().popover_foreground
+                    }
+                }),
+        )
+}
+
+fn virtual_image_preview(
+    pos: Position,
+    data_rev: nsh_core::prelude::Memo<u64>,
+    is_selected: impl Fn() -> bool + Copy + 'static,
+) -> impl IntoElement {
+    let thumb_data = computed(move || {
+        let _rev = data_rev.get();
+        let idx = pos.index();
+        state::store_signal().with(|s| {
+            let item = s.visible_at(idx)?;
+            let thumb = state::cached_image_thumbnail(item, IMAGE_THUMB_MAX_W, IMAGE_THUMB_MAX_H);
+            let meta = format!("{} · {}", item.text, item.formatted_size());
+            Some((thumb, meta))
+        })
+    });
+
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2p5()
+        .overflow_hidden()
+        .child(dynamic(move || {
+            let Some((thumb, meta)) = thumb_data.get() else {
+                return view().into_element();
+            };
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2p5()
+                .overflow_hidden()
+                .child(thumb.map(|(w, h, src)| {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "thumbnail pixel dimensions are <= 160 and exact in f32"
+                    )]
+                    let (wf, hf) = (w as f32, h as f32);
+                    image(src)
+                        .w(px(wf.min(120.0)))
+                        .h(px(hf.min(38.0)))
+                        .rounded(tokens::radius_inset)
+                        .border_1()
+                        .border_color(move || theme().border)
+                }))
+                .child(
+                    text(meta)
+                        .text_xs()
+                        .text_color(move || {
+                            if is_selected() {
+                                theme().primary_foreground
+                            } else {
+                                theme().muted_foreground
+                            }
+                        })
+                        .truncate(),
+                )
+                .into_element()
+        }))
+}
+
+fn virtual_row_trailing(
+    pos: Position,
+    is_selected: impl Fn() -> bool + Copy + 'static,
+) -> impl IntoElement {
     view()
         .flex_row()
         .items_center()
@@ -420,19 +611,19 @@ fn clipping_row_trailing(index: usize, is_selected: bool) -> impl IntoElement {
                     is_selected,
                     false,
                     move || {
-                        state::select_index(index);
+                        state::select_index(pos.index());
                         state::toggle_preview();
                     },
                 )),
         )
         .child(
-            view().w(px(20.0)).items_end().child(
-                text(index_label)
+            view().w(px(24.0)).items_end().child(
+                text(move || (pos.index() + 1).to_string())
                     .text_xs()
                     .italic()
                     .tabular_nums()
                     .text_color(move || {
-                        if is_selected {
+                        if is_selected() {
                             theme().primary_foreground.opacity(0.9)
                         } else {
                             theme().muted_foreground
@@ -443,6 +634,16 @@ fn clipping_row_trailing(index: usize, is_selected: bool) -> impl IntoElement {
 }
 
 fn delete_confirm_bar() -> impl IntoElement {
+    on_key_with(
+        "space",
+        KeyOptions {
+            when: When::Always,
+            repeat: false,
+            ..KeyOptions::default()
+        },
+        |_| state::confirm_delete_pending(),
+    );
+
     let snippet = computed(|| {
         state::store_signal().with(|s| {
             s.pending_delete_id
@@ -499,45 +700,6 @@ fn delete_confirm_bar() -> impl IntoElement {
                     false,
                     state::confirm_delete_pending,
                 )),
-        )
-}
-
-fn image_row_preview(item: &Clipping, is_selected: bool) -> impl IntoElement {
-    let thumb = item
-        .decode_bounded_rgba(IMAGE_THUMB_MAX_W, IMAGE_THUMB_MAX_H)
-        .map(|(w, h, rgba)| (w, h, ImageSrc::rgba(w, h, rgba)));
-
-    let meta = format!("{} · {}", item.text, item.formatted_size());
-
-    view()
-        .flex_row()
-        .items_center()
-        .gap_2p5()
-        .overflow_hidden()
-        .child(thumb.map(|(w, h, src)| {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "thumbnail pixel dimensions are <= 160 and exact in f32"
-            )]
-            let (wf, hf) = (w as f32, h as f32);
-            image(src)
-                .w(px(wf.min(120.0)))
-                .h(px(hf.min(38.0)))
-                .rounded(tokens::radius_inset)
-                .border_1()
-                .border_color(move || theme().border)
-        }))
-        .child(
-            text(meta)
-                .text_xs()
-                .text_color(move || {
-                    if is_selected {
-                        theme().primary_foreground
-                    } else {
-                        theme().muted_foreground
-                    }
-                })
-                .truncate(),
         )
 }
 

@@ -85,3 +85,6 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev.package."*"]
+opt-level = 2

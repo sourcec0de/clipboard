@@ -17,7 +17,6 @@ use crate::ui::tokens;
 
 /// Semantic tone for [`badge`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(dead_code, reason = "complete design-system badge tone scale")]
 pub(crate) enum BadgeTone {
     /// Quiet neutral metadata badge.
     Neutral,

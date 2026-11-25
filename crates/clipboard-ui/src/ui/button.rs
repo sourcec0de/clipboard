@@ -121,7 +121,7 @@ pub(crate) fn svg_icon_button<M>(
     svg_markup: &'static str,
     icon_size: f32,
     accessibility_name: &'static str,
-    on_selected_surface: bool,
+    on_selected_surface: impl Fn() -> bool + Copy + 'static,
     disabled: impl IntoProp<bool, M>,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
@@ -138,7 +138,16 @@ pub(crate) fn svg_icon_button<M>(
         .transition_colors()
         .duration(tokens::DURATION_INSTANT)
         .focus_visible(|s| s.outline(px(2.0)).outline_color(move || theme().ring))
-        .disabled_style(|s| s.opacity(0.4));
+        .disabled_style(|s| s.opacity(0.4))
+        .hover(move |s| {
+            s.bg(move || {
+                if on_selected_surface() {
+                    theme().primary_foreground.opacity(0.18)
+                } else {
+                    theme().accent
+                }
+            })
+        });
 
     if !reduced {
         btn = btn
@@ -147,17 +156,11 @@ pub(crate) fn svg_icon_button<M>(
             .active(|s| s.scale(tokens::ICON_PRESS_SCALE).opacity(0.85));
     }
 
-    btn = if on_selected_surface {
-        btn.hover(|s| s.bg(move || theme().primary_foreground.opacity(0.18)))
-    } else {
-        btn.hover(|s| s.bg(move || theme().accent))
-    };
-
     btn.child(crate::ui::icons::vector_icon(
         svg_markup,
         icon_size,
         move || {
-            if on_selected_surface {
+            if on_selected_surface() {
                 theme().primary_foreground
             } else {
                 theme().muted_foreground
