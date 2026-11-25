@@ -1,0 +1,12 @@
+{
+  "name": "Clipboard",
+  "id": "dev.sourcec0de.clipboard",
+  "version": "0.1.0",
+  "appearance": "system",
+  "theme": "theme.json",
+  "rust": "crates/clipboard-ui",
+  "root": "App",
+  "capabilities": {
+    "clipboard": true
+  }
+}
