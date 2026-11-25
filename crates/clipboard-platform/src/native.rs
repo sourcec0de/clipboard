@@ -242,6 +242,85 @@ impl PlatformHost for NativePlatform {
         }
     }
 
+    fn capture_frontmost_target(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let own_pid = std::process::id();
+            let script = concat!(
+                "ObjC.import('AppKit');",
+                "var app = $.NSWorkspace.sharedWorkspace.frontmostApplication;",
+                "if (app && !app.isNil()) { String(app.processIdentifier); } else { ''; }"
+            );
+            let out = Command::new("osascript")
+                .args(["-l", "JavaScript", "-e", script])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let pid_str = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            let pid: u32 = pid_str.parse().ok()?;
+            if pid == own_pid {
+                return None;
+            }
+            Some(pid_str)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let out = Command::new("xdotool")
+                .arg("getactivewindow")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let win_id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if win_id.is_empty() {
+                None
+            } else {
+                Some(win_id)
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    fn restore_focus(&self, target: Option<&str>) {
+        #[cfg(target_os = "macos")]
+        {
+            let script = target.and_then(|s| s.parse::<u32>().ok()).map_or_else(
+                || {
+                    let own_pid = std::process::id();
+                    format!(
+                        "tell application \"System Events\" to set visible of (first application process whose unix id is {own_pid}) to false"
+                    )
+                },
+                |target_pid| {
+                    format!(
+                        "tell application \"System Events\" to set frontmost of (first application process whose unix id is {target_pid}) to true"
+                    )
+                },
+            );
+            let _ = Command::new("osascript").args(["-e", &script]).output();
+            std::thread::sleep(std::time::Duration::from_millis(90));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(win_id) = target {
+                let _ = Command::new("xdotool")
+                    .args(["windowactivate", "--sync", win_id])
+                    .output();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = target;
+        }
+    }
+
     fn list_installed_apps(&self) -> Vec<InstalledApp> {
         #[cfg(target_os = "macos")]
         {

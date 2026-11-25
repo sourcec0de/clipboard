@@ -155,6 +155,8 @@ pub(crate) struct AppState {
     pub filter_picker_open: bool,
     /// Clipping ID awaiting user confirmation before deletion (`Delete` key prompt).
     pub pending_delete_id: Option<Uuid>,
+    /// OS handle (e.g. macOS PID / X11 window ID) of the app that had focus before opening the overlay.
+    pub previous_app_target: Option<String>,
     /// Whether Sequential Paste Mode is currently recording copies into the FIFO queue.
     pub sequential_mode_active: bool,
     /// Currently recording global shortcut action on the Shortcuts tab.
@@ -282,6 +284,7 @@ pub(crate) fn ensure_started() {
         preview_open: false,
         filter_picker_open: false,
         pending_delete_id: None,
+        previous_app_target: None,
         sequential_mode_active: false,
         recording_shortcut: None,
         selected_blacklist_index: Some(0),
@@ -330,6 +333,7 @@ pub(crate) fn store_signal() -> Signal<AppState> {
                     preview_open: false,
                     filter_picker_open: false,
                     pending_delete_id: None,
+                    previous_app_target: None,
                     sequential_mode_active: false,
                     recording_shortcut: None,
                     selected_blacklist_index: None,
@@ -461,8 +465,14 @@ pub(crate) fn toggle_overlay() {
     }
 }
 
-/// Opens the floating Quick Paste overlay, resets selection to the top item, and focuses search.
+/// Opens the floating Quick Paste overlay, captures the previously focused app, and focuses search.
 pub(crate) fn open_overlay() {
+    let prev_target = if is_background_polling_enabled() {
+        with_host(|h| h.capture_frontmost_target()).flatten()
+    } else {
+        None
+    };
+    log::info!("open_overlay: captured previous_app_target={prev_target:?}");
     store_signal().update(|s| {
         s.overlay_open = true;
         s.search_query.clear();
@@ -470,6 +480,7 @@ pub(crate) fn open_overlay() {
         s.list_focused = false;
         s.filter_picker_open = false;
         s.pending_delete_id = None;
+        s.previous_app_target = prev_target;
         s.search_focus_seq = s.search_focus_seq.saturating_add(1);
     });
 }
@@ -483,6 +494,22 @@ pub(crate) fn close_overlay() {
         s.pending_delete_id = None;
         s.list_focused = false;
     });
+}
+
+/// Closes the overlay without pasting and restores focus to the previously active application.
+pub(crate) fn dismiss_overlay_and_restore_focus() {
+    let target = store_signal().with(|s| s.previous_app_target.clone());
+    close_overlay();
+    if is_background_polling_enabled()
+        && let Some(host) = RUNTIME
+            .get()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|guard| guard.as_ref().map(|rt| Arc::clone(&rt.host)))
+    {
+        thread::spawn(move || {
+            host.restore_focus(target.as_deref());
+        });
+    }
 }
 
 /// Cycles the overlay source (`Clipboard` -> `Sequential Queue` -> `Pinned`).
@@ -592,8 +619,8 @@ pub(crate) fn paste_selected(plain_override: bool) {
         )
     });
     if let Some(item) = clipping {
-        deliver_clipping(&item, plain_override || always_plain, None, play_sound);
         close_overlay();
+        deliver_clipping(&item, plain_override || always_plain, None, play_sound);
     }
 }
 
@@ -606,8 +633,8 @@ pub(crate) fn paste_selected_with_filter(filter: TextFilter) {
         persist_settings(&s.settings);
     });
     if let Some(item) = clipping {
-        deliver_clipping(&item, true, Some(filter), play_sound);
         close_overlay();
+        deliver_clipping(&item, true, Some(filter), play_sound);
     }
 }
 
@@ -759,6 +786,8 @@ fn deliver_clipping(
         _ => return,
     };
 
+    let target_app = store_signal().with(|s| s.previous_app_target.clone());
+
     mark_self_write();
     let Some(host) = RUNTIME
         .get()
@@ -768,11 +797,18 @@ fn deliver_clipping(
         return;
     };
 
-    // Perform clipboard write + paste simulation off the UI thread so the overlay closes immediately.
+    // Perform clipboard write, restore focus to original app, and simulate paste off the UI thread.
     thread::spawn(move || {
-        let res = host
-            .write_clipboard(&payload)
-            .and_then(|()| host.simulate_paste());
+        log::info!("deliver_clipping: restoring focus to target={target_app:?} and pasting");
+        let res = host.write_clipboard(&payload).and_then(|()| {
+            host.restore_focus(target_app.as_deref());
+            host.simulate_paste()
+        });
+        if let Err(ref err) = res {
+            log::warn!("paste failed: {err}");
+        } else {
+            log::info!("deliver_clipping: paste succeeded");
+        }
         if play_sound {
             if res.is_ok() {
                 host.play_sound(SoundEffect::Paste);

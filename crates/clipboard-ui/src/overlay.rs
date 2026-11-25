@@ -206,18 +206,17 @@ fn bind_overlay_keys() {
         if state::store_signal().with(|s| s.pending_delete_id.is_some()) {
             state::cancel_delete_pending();
         } else {
-            state::close_overlay();
+            state::dismiss_overlay_and_restore_focus();
         }
     });
     on_key_with("delete", once_opts, |_| state::request_delete_selected());
     on_key_with("mod+backspace", once_opts, |_| {
         state::request_delete_selected();
     });
-    on_key_with("backspace", once_opts, |_| {
-        let query_empty = state::store_signal().with(|s| s.search_query.is_empty());
-        if query_empty {
-            state::request_delete_selected();
-        }
+    // Only trigger delete-prompt on plain Backspace when NOT typing in the search input,
+    // so Backspace and Cmd+A + Backspace work natively inside the search field.
+    on_key_with("backspace", KeyOptions::default(), |_| {
+        state::request_delete_selected();
     });
     on_key_with("tab", once_opts, |_| state::toggle_preview());
 }

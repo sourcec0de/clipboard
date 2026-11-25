@@ -188,6 +188,12 @@ impl PlatformHost for FakePlatform {
         self.frontmost.lock().ok().and_then(|g| g.clone())
     }
 
+    fn capture_frontmost_target(&self) -> Option<String> {
+        Some("fake-target-app".to_owned())
+    }
+
+    fn restore_focus(&self, _target: Option<&str>) {}
+
     fn list_installed_apps(&self) -> Vec<InstalledApp> {
         self.installed_apps
             .lock()

@@ -41,6 +41,13 @@ pub trait PlatformHost: Send + Sync + Debug {
     /// Returns the display name of the currently frontmost application, if available.
     fn frontmost_app(&self) -> Option<String>;
 
+    /// Captures an OS-specific handle (e.g. macOS PID or X11 window ID) for the currently
+    /// frontmost external application so focus can be restored when the overlay closes.
+    fn capture_frontmost_target(&self) -> Option<String>;
+
+    /// Yields focus from our process and restores focus to `target` (when provided).
+    fn restore_focus(&self, target: Option<&str>);
+
     /// Lists locally installed desktop applications for the Blacklist picker.
     fn list_installed_apps(&self) -> Vec<InstalledApp>;
 
